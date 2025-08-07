@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-redfin_scraper_plus.py  •  2025-08-07
-Outputs:
-    address, price, lotSize, yearBuilt, livingArea, bedrooms, bathrooms
-to house_details_redfin.csv
+redfin_scraper_v2.py   –   2025-08-07
+Outputs CSV columns: address, price, lotSize(acres), yearBuilt,
+                     livingArea(sqft), bedrooms, bathrooms
 """
 
 import csv, html, random, re, time
-from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -16,18 +14,28 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 
-# ───────────────────────── helpers ──────────────────────────
+ACRES_PER_SQFT = 43_560
+WAIT_SECS      = 15
+PAUSE_RANGE    = (4, 8)          # polite pause between addresses
+
+
+# ────────────────────────── small helpers ─────────────────────────
 def handle_cookie_banner(driver):
     try:
-        btn = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((
-                By.XPATH,
-                "//*[contains(text(),'Accept all cookies')]"
-                " | //button[contains(text(),'Accept')]")))
-        driver.execute_script("arguments[0].click();", btn)
+        b = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable(
+                (By.XPATH,
+                 "//*[contains(text(),'Accept all cookies')]"
+                 "| //button[contains(text(),'Accept')]")))
+        driver.execute_script("arguments[0].click();", b)
         time.sleep(1)
     except TimeoutException:
         pass
+
+
+def _strip_money(txt: str) -> str:
+    """'$426,090' → '426090' (digits only for CSV)."""
+    return re.sub(r"[^\d]", "", txt)
 
 
 def _visible_price(driver, secs=7):
@@ -35,124 +43,142 @@ def _visible_price(driver, secs=7):
     try:
         el = WebDriverWait(driver, secs).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, css)))
-        txt = el.text.strip()
-        if not txt:
-            return None
-        par = (el.find_element(By.XPATH, "..").get_attribute("data-testid") or "")
-        return ("Redfin Estimate" if "avm-price" in par else "List Price"), txt
+        return el.text.strip()
     except TimeoutException:
-        return None
+        return ""
 
 
-def _regex_price(src):
-    m = re.search(r'"avmText":"([^"]*?\$[0-9,]+)', src)
-    if m:
-        return "Redfin Estimate", re.search(r'\$[0-9,]+', html.unescape(m.group(1))).group(0)
-    m = re.search(r'"segments":\s*\[.*?"text":"[^"]*?FOR \$([0-9,]+)', src, re.DOTALL)
-    if m:
-        return "Sold Price", f"${m.group(1)}"
-    return None
-
-
-def _parse_extras(src):
-    """Return dict with lotSize(acres), yearBuilt, livingArea(sqft), beds, baths."""
-    d = {"lotSize": None, "yearBuilt": None, "livingArea": None,
-         "bedrooms": None, "bathrooms": None}
-
-    # JSON: sq ft
-    m = re.search(r'"sqFt"\s*:\s*{[^}]*"value"\s*:\s*([0-9]+)', src)
-    if m:
-        d["livingArea"] = int(m.group(1))
-
-    # JSON: beds/baths
-    m = re.search(r'"beds"\s*:\s*([0-9]+)', src);  d["bedrooms"]  = int(m.group(1)) if m else None
-    m = re.search(r'"baths"\s*:\s*([0-9\.]+)', src); d["bathrooms"] = float(m.group(1)) if m else None
-
-    # JSON: year built
-    m = re.search(r'"yearBuilt"\s*:\s*([0-9]{4})', src)
-    if m: d["yearBuilt"] = int(m.group(1))
-
-    # Lot size – JSON sometimes uses lotSizeValue / lotSizeUnits
-    m = re.search(r'"lotSize[A-Za-z]*"\s*:\s*([0-9\.]+)', src)
-    if m:
-        d["lotSize"] = float(m.group(1))
-    else:
-        # fallback to rendered text: “1.57 acres Lot Size”
-        m = re.search(r'([0-9\.]+)\s*acre[s]?\s*Lot Size', src, re.IGNORECASE)
+def _regex_price(src: str):
+    for pat in (
+        r'"avmText":"[^"]*?\$([0-9,]+)',                          # Redfin estimate
+        r'"segments":\s*\[.*?FOR\s+\$([0-9,]+)'                   # sold banner
+    ):
+        m = re.search(pat, src, re.DOTALL)
         if m:
-            d["lotSize"] = float(m.group(1))
+            return m.group(1)
+    return ""
 
-    # final fallback for missing sqft / beds / baths in paragraph
-    if d["livingArea"] is None:
-        m = re.search(r'([0-9,]+)\s+square foot', src)
-        if m: d["livingArea"] = int(m.group(1).replace(",", ""))
-    if d["bedrooms"] is None or d["bathrooms"] is None:
-        m = re.search(r'with ([0-9]+) bedrooms? and ([0-9\.]+) bathrooms?', src)
+
+# ─────────────── parse living area / lot size / facts ───────────────
+def parse_home_facts(src: str) -> dict:
+    """Return dict with livingArea, lotSize (acres), yearBuilt, beds, baths."""
+    facts = {k: "" for k in
+             ("livingArea", "lotSize", "yearBuilt", "beds", "baths")}
+
+    # 1️⃣  Embedded JSON (fast & language-agnostic) -------------------
+    block = re.search(r'"addressSectionInfo":\{.+?}', src, re.DOTALL)
+    if block:
+        j = block.group(0)
+
+        def jnum(pat, as_float=False):
+            m = re.search(pat, j)
+            if m:
+                return (m.group(1).replace(",", "") if not as_float
+                        else m.group(1))
+            return ""
+
+        # living area -------------------------------------------------
+        facts["livingArea"] = (
+            jnum(r'"sqFtFinished"\s*:\s*([0-9,]+)') or
+            jnum(r'"sqFt"\s*\{\s*"displayLevel":[0-9]+,\s*"value":\s*([0-9,]+)')
+        )
+
+        # lot size (convert to acres if we only get square-feet) ------
+        lot_sqft = jnum(r'"lotSize"\s*:\s*([0-9,]+)')
+        if not lot_sqft:
+            lot_sqft = jnum(r'"lotSize"\s*\{\s*"displayLevel":[0-9]+,\s*"value":\s*([0-9,]+)')
+        if lot_sqft:
+            acres = round(int(lot_sqft.replace(",", "")) / ACRES_PER_SQFT, 2)
+            facts["lotSize"] = str(acres)
+
+        # simple numeric keys ----------------------------------------
+        facts["yearBuilt"] = jnum(r'"yearBuilt"\s*:\s*([0-9]{4})')
+        facts["beds"]      = jnum(r'"beds"\s*:\s*([0-9]+)')
+        facts["baths"]     = jnum(r'"baths"\s*:\s*([0-9.]+)', as_float=True)
+
+    # 2️⃣  HTML fall-backs (only if still blank) ----------------------
+    if not facts["livingArea"]:
+        m = re.search(r'([\d,]+)\s+square\s+foot', src, re.I)
         if m:
-            if d["bedrooms"]   is None: d["bedrooms"]   = int(m.group(1))
-            if d["bathrooms"]  is None: d["bathrooms"]  = float(m.group(2))
+            facts["livingArea"] = m.group(1).replace(",", "")
 
-    return d
+    if not facts["lotSize"]:
+        m = re.search(r'([0-9.]+)\s*acre(?:s)?\s+lot', src, re.I)
+        if m:
+            facts["lotSize"] = m.group(1)
+
+    if not facts["yearBuilt"]:
+        m = re.search(r'Year Built[^0-9]*([0-9]{4})', src, re.I)
+        if m:
+            facts["yearBuilt"] = m.group(1)
+
+    if not facts["beds"]:
+        m = re.search(r'(\d+)\s+bed(?:room)?s?', src, re.I)
+        if m:
+            facts["beds"] = m.group(1)
+
+    if not facts["baths"]:
+        m = re.search(r'(\d+(?:\.\d)?)\s+bath', src, re.I)
+        if m:
+            facts["baths"] = m.group(1)
+
+    return facts
 
 
-def _digits(txt):  # strip $, commas → digits
-    return re.sub(r"[^\d.]", "", txt) if txt else ""
+# ─────────────────────── scrape one address ───────────────────────
+def scrape_one(driver, address: str) -> dict:
+    w = WebDriverWait(driver, WAIT_SECS)
 
-
-# ───────────────────── core scrape routine ─────────────────────
-def scrape(driver, address):
-    wait = WebDriverWait(driver, 15)
-
+    # Redfin home → search
     driver.get("https://www.redfin.com")
     handle_cookie_banner(driver)
-    box = wait.until(EC.presence_of_element_located((By.ID, "search-box-input")))
+    box = w.until(EC.presence_of_element_located((By.ID, "search-box-input")))
     box.clear(); box.send_keys(address); box.send_keys(Keys.ENTER)
-    wait.until(EC.presence_of_element_located((By.TAG_NAME, "body"))); time.sleep(3)
+    w.until(EC.presence_of_element_located((By.TAG_NAME, "body"))); time.sleep(3)
 
-    price_pair = _visible_price(driver) or _regex_price(driver.page_source)
+    # price (widget → regex)
+    price = _visible_price(driver) or _regex_price(driver.page_source)
 
-    if not price_pair:   # SECOND-ENTER fallback (multi-grid)
+    # ambiguous results → “second-ENTER”
+    if not price:
         try:
             cur = driver.current_url
-            box2 = wait.until(EC.presence_of_element_located((By.ID, "search-box-input")))
-            driver.execute_script("arguments[0].focus();", box2)
-            box2.send_keys(Keys.END); box2.send_keys(Keys.ENTER)
+            sb  = w.until(EC.presence_of_element_located((By.ID, "search-box-input")))
+            sb.send_keys(Keys.END); sb.send_keys(Keys.ENTER)
             WebDriverWait(driver, 10).until(EC.url_changes(cur)); time.sleep(3)
-            price_pair = _visible_price(driver, 5) or _regex_price(driver.page_source)
+            price = _visible_price(driver, 5) or _regex_price(driver.page_source)
         except TimeoutException:
             pass
 
-    if not price_pair:   # SOLD filter fallback
-        cur = driver.current_url
-        sold_url = cur + (",include=sold" if "/filter/" in cur else "/filter/include=sold")
-        driver.get(sold_url); time.sleep(5)
-        price_pair = _visible_price(driver, 5) or _regex_price(driver.page_source)
+    # final fallback → include=sold
+    if not price:
+        sold = driver.current_url + (",include=sold" if "/filter/" in driver.current_url
+                                     else "/filter/include=sold")
+        driver.get(sold); time.sleep(4)
+        price = _visible_price(driver, 5) or _regex_price(driver.page_source)
 
-    price_clean = _digits(price_pair[1]) if price_pair else ""
+    price = _strip_money(price)
 
-    extras = _parse_extras(driver.page_source)
-    
-    # Save the final page HTML to a file for debugging (after all attempts)
-    print("  > Saving final page HTML to html.txt...")
-    with open("html.txt", "w", encoding="utf-8") as f:
-        f.write(driver.page_source)
-    
+    # other facts
+    facts = parse_home_facts(driver.page_source)
+
     return {
-        "price":      price_clean,
-        "lotSize":    extras["lotSize"]    or "",
-        "yearBuilt":  extras["yearBuilt"]  or "",
-        "livingArea": extras["livingArea"] or "",
-        "bedrooms":   extras["bedrooms"]   or "",
-        "bathrooms":  extras["bathrooms"]  or "",
+        "address":    address,
+        "price":      price,
+        "lotSize":    facts["lotSize"],
+        "yearBuilt":  facts["yearBuilt"],
+        "livingArea": facts["livingArea"],
+        "bedrooms":   facts["beds"],
+        "bathrooms":  facts["baths"]
     }
 
 
-# ───────────────────────── runner ────────────────────────────
+# ───────────────────────── runner ──────────────────────────
 def main():
-    IN_CSV, OUT_CSV = "testing.csv", "house_details_redfin.csv"
+    IN_FILE, OUT_FILE = "testing.csv", "house_details_redfin.csv"
 
     opts = Options()
-    # opts.add_argument("--headless");  opts.add_argument("--window-size=1920,1080")
+    # opts.add_argument("--headless=new")   # uncomment for headless mode
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument(
         "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -161,12 +187,13 @@ def main():
     driver = webdriver.Chrome(options=opts); driver.maximize_window()
 
     try:
-        with open(IN_CSV, newline='', encoding='utf-8') as fi, \
-             open(OUT_CSV, 'w', newline='', encoding='utf-8') as fo:
+        with open(IN_FILE, newline='', encoding='utf-8') as fin, \
+             open(OUT_FILE, 'w', newline='', encoding='utf-8') as fout:
 
-            rdr, wtr = csv.reader(fi), csv.writer(fo)
-            wtr.writerow(["address", "price", "lotSize", "yearBuilt",
-                          "livingArea", "bedrooms", "bathrooms"])
+            rdr, wtr = csv.reader(fin), csv.writer(fout)
+            wtr.writerow(["address", "price", "lotSize(acres)",
+                          "yearBuilt", "livingArea(sqft)",
+                          "bedrooms", "bathrooms"])
 
             rows = list(rdr)
             if rows and rows[0][0].strip().lower() == "address":
@@ -175,14 +202,15 @@ def main():
             for row in rows:
                 if not row: continue
                 addr = row[0].strip()
-                print("\n──── Scraping:", addr)
-                data = scrape(driver, addr)
-                wtr.writerow([addr,
-                              data["price"], data["lotSize"], data["yearBuilt"],
-                              data["livingArea"], data["bedrooms"], data["bathrooms"]])
-                print("   →", data)
-                time.sleep(random.uniform(4, 8))
+                print(f"\n→ Scraping {addr} …")
+                data = scrape_one(driver, addr)
+                print("   ", data)             # live terminal output
 
+                wtr.writerow([data["address"], data["price"], data["lotSize"],
+                              data["yearBuilt"], data["livingArea"],
+                              data["bedrooms"], data["bathrooms"]])
+
+                time.sleep(random.uniform(*PAUSE_RANGE))
     finally:
         driver.quit()
 
